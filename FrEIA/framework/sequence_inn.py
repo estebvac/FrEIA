@@ -52,11 +52,25 @@ class SequenceINN(InvertibleModule):
         if cond is not None:
             kwargs['dims_c'] = [cond_shape]
 
-        module = module_class(dims_in, **kwargs)
+        if isinstance(module_class, InvertibleModule):
+            module = module_class
+            if module.dims_in != dims_in:
+                raise ValueError(
+                    f"You passed an instance of {module.__class__} to "
+                    f"SequenceINN which expects a {module.dims_in} input, "
+                    f"but the output of the previous layer is of shape "
+                    f"{dims_in}."
+                )
+        else:
+            module = module_class(dims_in, **kwargs)
         self.module_list.append(module)
-        ouput_dims = module.output_dims(dims_in)
-        assert len(ouput_dims) == 1, "Module has more than one output"
-        self.shapes.append(ouput_dims[0])
+        output_dims = module.output_dims(dims_in)
+        if len(output_dims) != 1:
+            raise ValueError(
+                f"Module of type {module.__class__} has more than one output: "
+                f"{output_dims}"
+            )
+        self.shapes.append(output_dims[0])
 
     def __getitem__(self, item):
         return self.module_list.__getitem__(item)
@@ -67,11 +81,24 @@ class SequenceINN(InvertibleModule):
     def __iter__(self):
         return self.module_list.__iter__()
 
-    def output_dims(self, input_dims: List[Tuple[int]]) -> List[Tuple[int]]:
-        if not self.force_tuple_output:
-            raise ValueError("You can only call output_dims on a SequentialINN "
-                             "when setting force_tuple_output=True.")
-        return input_dims
+    def output_dims(self, input_dims: List[Tuple[int]] = None) \
+            -> List[Tuple[int]]:
+        """
+        Extends the definition in InvertibleModule to also return the output
+        dimension when
+        """
+        if input_dims is not None:
+            if self.force_tuple_output:
+                if input_dims != self.shapes[0]:
+                    raise ValueError(f"Passed input shapes {input_dims!r} do "
+                                     f"not match with those passed in the "
+                                     f"construction of the SequenceINN "
+                                     f"{self.shapes[0]}")
+            else:
+                raise ValueError("You can only call output_dims on a "
+                                 "SequenceINN when setting "
+                                 "force_tuple_output=True.")
+        return [self.shapes[-1]]
 
     def forward(self, x_or_z: Tensor, c: Iterable[Tensor] = None,
                 rev: bool = False, jac: bool = True) -> Tuple[Tensor, Tensor]:
@@ -103,7 +130,8 @@ class SequenceINN(InvertibleModule):
             if self.conditions[i] is None:
                 x_or_z, j = self.module_list[i](x_or_z, jac=jac, rev=rev)
             else:
-                x_or_z, j = self.module_list[i](x_or_z, c=[c[self.conditions[i]]],
+                x_or_z, j = self.module_list[i](x_or_z,
+                                                c=[c[self.conditions[i]]],
                                                 jac=jac, rev=rev)
             log_det_jac = j + log_det_jac
 
