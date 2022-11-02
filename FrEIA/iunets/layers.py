@@ -2,24 +2,22 @@
 Code modified from iU-nets:
 https://github.com/cetmann/iunets
 """
-
+from typing import Tuple, List
+from typing import Union
 from warnings import warn
-from typing import Callable, Union, Iterable, Tuple
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.nn.common_types import _size_1_t, _size_2_t, _size_3_t
 from torch.nn.modules.utils import _single, _pair, _triple
-import torch.nn.functional as F
-from torch.autograd import Function
 
-
-import numpy as np
-
-from .utils import get_num_channels
-from .expm import expm
+from FrEIA.modules import InvertibleModule
 from .cayley import cayley
+from .expm import expm
 from .householder import householder_transform
+from .utils import get_num_channels
 
 
 def __calculate_kernel_matrix_exp__(weight, **kwargs):
@@ -42,16 +40,25 @@ def __calculate_kernel_matrix_householder__(weight, **kwargs):
 
 def __calculate_kernel_matrix_givens__(weight, **kwargs):
     raise NotImplementedError("Parametrization via Givens rotations not "
-        "implemented.")
+                              "implemented.")
 
 
 def __calculate_kernel_matrix_bjork__(weight, **kwargs):
     raise NotImplementedError("Parametrization via Bjork peojections "
-        "not implemented.")
+                              "not implemented.")
 
 
+def _check_in_dims(dims_in: Union[int, Tuple[int], List[Tuple[int]]]) -> List[Tuple[int]]:
+    if isinstance(dims_in, tuple):
+        dims_in = [dims_in]
+    elif isinstance(dims_in, list):
+        if not all([isinstance(d, tuple) for d in dims_in]):
+            raise TypeError(f"dims_in must be tuple or list of tuple but {dims_in} was given")
 
-class OrthogonalResamplingLayer(torch.nn.Module):
+    return dims_in
+
+
+class OrthogonalResamplingLayer(InvertibleModule):
     """Base class for orthogonal up- and downsampling operators.
 
     :param low_channel_number:
@@ -70,6 +77,7 @@ class OrthogonalResamplingLayer(torch.nn.Module):
     """
 
     def __init__(self,
+                 dims_in,
                  low_channel_number: int,
                  stride: Union[int, Tuple[int, ...]],
                  method: str = 'cayley',
@@ -78,7 +86,7 @@ class OrthogonalResamplingLayer(torch.nn.Module):
                  init_kwargs: dict = None,
                  **kwargs):
 
-        super(OrthogonalResamplingLayer, self).__init__()
+        super(OrthogonalResamplingLayer, self).__init__(dims_in, **kwargs)
         self.low_channel_number = low_channel_number
         self.method = method
         self.stride = stride
@@ -130,21 +138,29 @@ class OrthogonalResamplingLayer(torch.nn.Module):
         """
         return self.kernel_matrix.reshape(*self._kernel_shape)
 
+    def output_dims(self, input_dims: List[Tuple[int]]) -> List[Tuple[int]]:
+        in_batch = torch.zeros((2,) + input_dims[0])
+        out_shape = tuple(self((in_batch, 0))[0][0].shape)[1:]
+        return [out_shape]
+
 
 class InvertibleDownsampling1D(OrthogonalResamplingLayer):
     def __init__(self,
-                 in_channels: int,
+                 dims_in: Union[Tuple[int], List[Tuple[int]]],
                  stride: _size_1_t = 2,
                  method: str = 'cayley',
                  init: str = 'haar',
                  learnable: bool = True,
                  *args,
                  **kwargs):
+        dims_in = _check_in_dims(dims_in)
+        self.in_channels = dims_in[0][0]
+
         stride = tuple(_single(stride))
         channel_multiplier = int(np.prod(stride))
-        self.in_channels = in_channels
-        self.out_channels = in_channels * channel_multiplier
+        self.out_channels = self.in_channels * channel_multiplier
         super(InvertibleDownsampling1D, self).__init__(
+            dims_in=dims_in,
             low_channel_number=self.in_channels,
             stride=stride,
             method=method,
@@ -154,10 +170,15 @@ class InvertibleDownsampling1D(OrthogonalResamplingLayer):
             **kwargs
         )
 
-    def forward(self, x):
+    def forward(self, x, c=None, jac=True, rev=False):
         # Convolve with stride 2 in order to invertibly downsample.
-        return F.conv1d(
-            x, self.kernel, stride=self.stride, groups=self.low_channel_number)
+        x_ = x[0]
+        if not rev:
+            output = F.conv1d(x_, self.kernel, stride=self.stride, groups=self.low_channel_number)
+            return (output,), 0.
+        else:
+            output = F.conv_transpose1d(x_, self.kernel, stride=self.stride, groups=self.low_channel_number)
+            return (output,), 0.
 
     def inverse(self, x):
         # Apply transposed convolution in order to invert the downsampling.
@@ -167,18 +188,21 @@ class InvertibleDownsampling1D(OrthogonalResamplingLayer):
 
 class InvertibleUpsampling1D(OrthogonalResamplingLayer):
     def __init__(self,
-                 in_channels: int,
+                 dims_in: Union[Tuple[int], List[Tuple[int]]],
                  stride: _size_1_t = 2,
                  method: str = 'cayley',
                  init: str = 'haar',
                  learnable: bool = True,
                  *args,
                  **kwargs):
+        dims_in = _check_in_dims(dims_in)
+        self.in_channels = dims_in[0][0]
+
         stride = tuple(_pair(stride))
         channel_multiplier = int(np.prod(stride))
-        self.in_channels = in_channels
-        self.out_channels = in_channels // channel_multiplier
+        self.out_channels = self.in_channels // channel_multiplier
         super(InvertibleUpsampling1D, self).__init__(
+            dims_in=dims_in,
             low_channel_number=self.out_channels,
             stride=stride,
             method=method,
@@ -188,10 +212,15 @@ class InvertibleUpsampling1D(OrthogonalResamplingLayer):
             **kwargs
         )
 
-    def forward(self, x):
+    def forward(self, x, c=None, jac=True, rev=False):
         # Apply transposed convolution in order to invertibly upsample.
-        return F.conv_transpose1d(
-            x, self.kernel, stride=self.stride, groups=self.low_channel_number)
+        x_ = x[0]
+        if not rev:
+            output = F.conv_transpose1d(x_, self.kernel, stride=self.stride, groups=self.low_channel_number)
+            return (output,), 0.
+        else:
+            output = F.conv1d(x_, self.kernel, stride=self.stride, groups=self.low_channel_number)
+            return (output,), 0.
 
     def inverse(self, x):
         # Convolve with stride 2 in order to invert the upsampling.
@@ -201,18 +230,24 @@ class InvertibleUpsampling1D(OrthogonalResamplingLayer):
 
 class InvertibleDownsampling2D(OrthogonalResamplingLayer):
     def __init__(self,
-                 in_channels: int,
+                 dims_in: Union[Tuple[int], List[Tuple[int]]],
                  stride: _size_2_t = 2,
                  method: str = 'cayley',
                  init: str = 'haar',
                  learnable: bool = True,
                  *args,
                  **kwargs):
+
+        dims_in = _check_in_dims(dims_in)
+        self.in_channels = dims_in[0][0]
+
         stride = tuple(_pair(stride))
         channel_multiplier = int(np.prod(stride))
-        self.in_channels = in_channels
-        self.out_channels = in_channels * channel_multiplier
+        self.dims_in = dims_in
+
+        self.out_channels = self.in_channels * channel_multiplier
         super(InvertibleDownsampling2D, self).__init__(
+            dims_in=dims_in,
             low_channel_number=self.in_channels,
             stride=stride,
             method=method,
@@ -222,10 +257,15 @@ class InvertibleDownsampling2D(OrthogonalResamplingLayer):
             **kwargs
         )
 
-    def forward(self, x):
-        # Convolve with stride 2 in order to invertibly downsample.
-        return F.conv2d(
-            x, self.kernel, stride=self.stride, groups=self.low_channel_number)
+    def forward(self, x, c=None, jac=True, rev=False):
+        # Apply transposed convolution in order to invertibly upsample.
+        x_ = x[0]
+        if not rev:
+            output = F.conv2d(x_, self.kernel, stride=self.stride, groups=self.low_channel_number)
+            return (output,), 0.
+        else:
+            output = F.conv_transpose2d(x_, self.kernel, stride=self.stride, groups=self.low_channel_number)
+            return (output,), 0.
 
     def inverse(self, x):
         # Apply transposed convolution in order to invert the downsampling.
@@ -235,18 +275,21 @@ class InvertibleDownsampling2D(OrthogonalResamplingLayer):
 
 class InvertibleUpsampling2D(OrthogonalResamplingLayer):
     def __init__(self,
-                 in_channels: int,
+                 dims_in: Union[Tuple[int], List[Tuple[int]]],
                  stride: _size_2_t = 2,
                  method: str = 'cayley',
                  init: str = 'haar',
                  learnable: bool = True,
                  *args,
                  **kwargs):
+        dims_in = _check_in_dims(dims_in)
+        self.in_channels = dims_in[0][0]
+
         stride = tuple(_pair(stride))
         channel_multiplier = int(np.prod(stride))
-        self.in_channels = in_channels
-        self.out_channels = in_channels // channel_multiplier
+        self.out_channels = self.in_channels // channel_multiplier
         super(InvertibleUpsampling2D, self).__init__(
+            dims_in=dims_in,
             low_channel_number=self.out_channels,
             stride=stride,
             method=method,
@@ -256,10 +299,15 @@ class InvertibleUpsampling2D(OrthogonalResamplingLayer):
             **kwargs
         )
 
-    def forward(self, x):
+    def forward(self, x, c=None, jac=True, rev=False):
         # Apply transposed convolution in order to invertibly upsample.
-        return F.conv_transpose2d(
-            x, self.kernel, stride=self.stride, groups=self.low_channel_number)
+        x_ = x[0]
+        if not rev:
+            output = F.conv_transpose2d(x_, self.kernel, stride=self.stride, groups=self.low_channel_number)
+            return (output,), 0.
+        else:
+            output = F.conv2d(x_, self.kernel, stride=self.stride, groups=self.low_channel_number)
+            return (output,), 0.
 
     def inverse(self, x):
         # Convolve with stride 2 in order to invert the upsampling.
@@ -269,18 +317,22 @@ class InvertibleUpsampling2D(OrthogonalResamplingLayer):
 
 class InvertibleDownsampling3D(OrthogonalResamplingLayer):
     def __init__(self,
-                 in_channels: int,
+                 dims_in: Union[Tuple[int], List[Tuple[int]]],
                  stride: _size_3_t = 2,
                  method: str = 'cayley',
                  init: str = 'haar',
                  learnable: bool = True,
                  *args,
                  **kwargs):
+
+        dims_in = _check_in_dims(dims_in)
+        self.in_channels = dims_in[0][0]
+
         stride = tuple(_triple(stride))
         channel_multiplier = int(np.prod(stride))
-        self.in_channels = in_channels
-        self.out_channels = in_channels * channel_multiplier
+        self.out_channels = self.in_channels * channel_multiplier
         super(InvertibleDownsampling3D, self).__init__(
+            dims_in=dims_in,
             low_channel_number=self.in_channels,
             stride=stride,
             method=method,
@@ -290,10 +342,15 @@ class InvertibleDownsampling3D(OrthogonalResamplingLayer):
             **kwargs
         )
 
-    def forward(self, x):
-        # Convolve with stride 2 in order to invertibly downsample.
-        return F.conv3d(
-            x, self.kernel, stride=self.stride, groups=self.low_channel_number)
+    def forward(self, x, c=None, jac=True, rev=False):
+        # Apply transposed convolution in order to invertibly upsample.
+        x_ = x[0]
+        if not rev:
+            output = F.conv3d(x_, self.kernel, stride=self.stride, groups=self.low_channel_number)
+            return (output,), 0.
+        else:
+            output = F.conv_transpose3d(x_, self.kernel, stride=self.stride, groups=self.low_channel_number)
+            return (output,), 0.
 
     def inverse(self, x):
         # Apply transposed convolution in order to invert the downsampling.
@@ -303,18 +360,21 @@ class InvertibleDownsampling3D(OrthogonalResamplingLayer):
 
 class InvertibleUpsampling3D(OrthogonalResamplingLayer):
     def __init__(self,
-                 in_channels: int,
+                 dims_in: Union[Tuple[int], List[Tuple[int]]],
                  stride: _size_3_t = 2,
                  method: str = 'cayley',
                  init: str = 'haar',
                  learnable: bool = True,
                  *args,
                  **kwargs):
+        dims_in = _check_in_dims(dims_in)
+        self.in_channels = dims_in[0][0]
+
         stride = tuple(_triple(stride))
         channel_multiplier = int(np.prod(stride))
-        self.in_channels = in_channels
-        self.out_channels = in_channels // channel_multiplier
+        self.out_channels = self.in_channels // channel_multiplier
         super(InvertibleUpsampling3D, self).__init__(
+            dims_in=dims_in,
             low_channel_number=self.out_channels,
             stride=stride,
             method=method,
@@ -324,10 +384,15 @@ class InvertibleUpsampling3D(OrthogonalResamplingLayer):
             **kwargs
         )
 
-    def forward(self, x):
+    def forward(self, x, c=None, jac=True, rev=False):
         # Apply transposed convolution in order to invertibly upsample.
-        return F.conv_transpose3d(
-            x, self.kernel, stride=self.stride, groups=self.low_channel_number)
+        x_ = x[0]
+        if not rev:
+            output = F.conv_transpose3d(x_, self.kernel, stride=self.stride, groups=self.low_channel_number)
+            return (output,), 0.
+        else:
+            output = F.conv3d(x_, self.kernel, stride=self.stride, groups=self.low_channel_number)
+            return (output,), 0.
 
     def inverse(self, x):
         # Convolve with stride 2 in order to invert the upsampling.
@@ -365,6 +430,7 @@ class ConcatenateChannels(torch.nn.Module):
         a, b = a.clone(), b.clone()
         del x
         return a, b
+
 
 class AdditiveCoupling(nn.Module):
     """Additive coupling layer, a basic invertible layer.
@@ -407,10 +473,10 @@ class AdditiveCoupling(nn.Module):
         split.
 
     """
+
     def __init__(self,
                  F: nn.Module,
                  channel_split_pos: int):
-
         super(AdditiveCoupling, self).__init__()
         self.F = F
         self.channel_split_pos = channel_split_pos
@@ -443,6 +509,7 @@ class StandardBlock(nn.Module):
                  depth=2,
                  zero_init=False,
                  normalization="instance",
+                 padding_mode='zeros',
                  **kwargs):
         super(StandardBlock, self).__init__()
 
@@ -459,7 +526,7 @@ class StandardBlock(nn.Module):
 
             if i == 0:
                 current_in_channels = num_in_channels
-            if i == depth-1:
+            if i == depth - 1:
                 current_out_channels = num_out_channels
 
             self.seq.append(
@@ -468,11 +535,12 @@ class StandardBlock(nn.Module):
                     current_out_channels,
                     3,
                     padding=1,
+                    padding_mode=padding_mode,
                     bias=False))
-            torch.nn.init.kaiming_uniform_(self.seq[-1].weight,
-                                           a=0.01,
-                                           mode='fan_out',
-                                           nonlinearity='leaky_relu')
+            # torch.nn.init.kaiming_uniform_(self.seq[-1].weight,
+            #                                a=0.01,
+            #                                mode='fan_out',
+            #                                nonlinearity='leaky_relu')
 
             if normalization == "instance":
                 norm_op = [nn.InstanceNorm1d,
@@ -499,7 +567,6 @@ class StandardBlock(nn.Module):
 
             self.seq.append(nn.LeakyReLU(inplace=True))
 
-
         # Initialize the block as the zero transform, such that the coupling
         # becomes the coupling becomes an identity transform (up to permutation
         # of channels)
@@ -509,11 +576,16 @@ class StandardBlock(nn.Module):
 
         self.F = nn.Sequential(*self.seq)
 
+    @classmethod
+    def constructor(cls, dim, c_in, c_out, **kwargs):
+        return cls(dim,
+                   c_in,
+                   c_out,
+                   **kwargs)
+
     def forward(self, x):
         x = self.F(x)
         return x
-
-
 
 
 def create_standard_module(in_channels, **kwargs):
@@ -541,11 +613,11 @@ def create_standard_module(in_channels, **kwargs):
     )
 
 
-def __initialize_weight__(kernel_matrix_shape : Tuple[int, ...],
-                          stride : Tuple[int, ...],
-                          method : str = 'cayley',
-                          init : str = 'haar',
-                          dtype : str = 'float32',
+def __initialize_weight__(kernel_matrix_shape: Tuple[int, ...],
+                          stride: Tuple[int, ...],
+                          method: str = 'cayley',
+                          init: str = 'haar',
+                          dtype: str = 'float32',
                           *args,
                           **kwargs):
     """Function which computes specific orthogonal matrices.
@@ -576,22 +648,23 @@ def __initialize_weight__(kernel_matrix_shape : Tuple[int, ...],
     # Determine dimensionality of the data and the number of matrices.
     dim = len(stride)
     num_matrices = kernel_matrix_shape[0]
-    
+
     # tbd: Givens, Householder, Bjork, give proper exception.
-    assert(method in ['exp', 'cayley', 'householder'])
+    assert (method in ['exp', 'cayley', 'householder'])
     if method == 'householder':
         warn('Householder parametrization not fully implemented yet. '
              'Only random initialization currently working.')
         init = 'random'
-        
+
     if init == 'random':
-        return torch.randn(kernel_matrix_shape).to('dtype')
-    
+        return torch.tensor(
+            np.random.randn(*kernel_matrix_shape).astype(dtype))  # torch.randn(kernel_matrix_shape).to(dtype)
+
     if init == 'haar' and set(stride) != {2}:
         print("Initialization 'haar' only available for stride 2.")
         print("Falling back to 'squeeze' transform...")
         init = 'squeeze'
-    
+
     if init == 'haar' and set(stride) == {2}:
         if method == 'exp':
             # The following matrices each parametrize the Haar transform when
@@ -600,16 +673,16 @@ def __initialize_weight__(kernel_matrix_shape : Tuple[int, ...],
             # "Computing exponentials of skew-symmetric matrices and logarithms
             # of orthogonal matrices." International Journal of Robotics and
             # Automation 18.1 (2003): 10-20.
-            p = np.pi/4
+            p = np.pi / 4
             if dim == 1:
                 weight = np.array([[[0, p],
                                     [0, 0]]],
                                   dtype=dtype)
             if dim == 2:
-                weight = np.array([[[0, 0,  p,  p],
+                weight = np.array([[[0, 0, p, p],
                                     [0, 0, -p, -p],
-                                    [0, 0,  0,  0],
-                                    [0, 0,  0,  0]]],
+                                    [0, 0, 0, 0],
+                                    [0, 0, 0, 0]]],
                                   dtype=dtype)
             if dim == 3:
                 weight = np.array(
@@ -622,38 +695,38 @@ def __initialize_weight__(kernel_matrix_shape : Tuple[int, ...],
                       [0, 0, 0, 0, 0, 0, 0, p],
                       [0, 0, 0, 0, 0, 0, 0, 0]]],
                     dtype=dtype)
-            
-            return torch.tensor(weight).repeat(num_matrices,1,1)
+
+            return torch.tensor(weight).repeat(num_matrices, 1, 1)
 
         elif method == 'cayley':
             # The following matrices parametrize a Haar kernel matrix
             # when applying the Cayley transform. These can be found by
             # applying an inverse Cayley transform to a Haar kernel matrix.
             if dim == 1:
-                p = -np.sqrt(2)/(2-np.sqrt(2))
+                p = -np.sqrt(2) / (2 - np.sqrt(2))
                 weight = np.array([[[0, p],
                                     [0, 0]]],
                                   dtype=dtype)
             if dim == 2:
                 p = .5
-                weight = np.array([[[0, 0,  p,  p],
+                weight = np.array([[[0, 0, p, p],
                                     [0, 0, -p, -p],
-                                    [0, 0,  0,  0],
-                                    [0, 0,  0,  0]]],
+                                    [0, 0, 0, 0],
+                                    [0, 0, 0, 0]]],
                                   dtype=dtype)
             if dim == 3:
-                p=1/np.sqrt(2)
+                p = 1 / np.sqrt(2)
                 weight = np.array(
-                    [[[0, -p, -p,  0,  -p,   0,   0, 1-p],
-                      [0,  0,  0, -p,   0,  -p, p-1,   0],
-                      [0,  0,  0, -p,   0, p-1,  -p,   0],
-                      [0,  0,  0,  0, 1-p,   0,   0,  -p],
-                      [0,  0,  0,  0,   0,  -p,  -p,   0],
-                      [0,  0,  0,  0,   0,   0,   0,  -p],
-                      [0,  0,  0,  0,   0,   0,   0,  -p],
-                      [0,  0,  0,  0,   0,   0,   0,   0]]],
+                    [[[0, -p, -p, 0, -p, 0, 0, 1 - p],
+                      [0, 0, 0, -p, 0, -p, p - 1, 0],
+                      [0, 0, 0, -p, 0, p - 1, -p, 0],
+                      [0, 0, 0, 0, 1 - p, 0, 0, -p],
+                      [0, 0, 0, 0, 0, -p, -p, 0],
+                      [0, 0, 0, 0, 0, 0, 0, -p],
+                      [0, 0, 0, 0, 0, 0, 0, -p],
+                      [0, 0, 0, 0, 0, 0, 0, 0]]],
                     dtype=dtype)
-            return torch.tensor(weight).repeat(num_matrices,1,1)
+            return torch.tensor(weight).repeat(num_matrices, 1, 1)
 
     if init in ['squeeze', 'pixel_shuffle', 'zeros']:
         if method == 'exp' or method == 'cayley':
@@ -669,8 +742,8 @@ def __initialize_weight__(kernel_matrix_shape : Tuple[int, ...],
         if len(init.shape) == 2:
             init = init.reshape(1, *init.shape)
         if init.shape[0] == 1:
-            init = init.repeat(num_matrices,1,1)
-        assert(init.shape == kernel_matrix_shape)
+            init = init.repeat(num_matrices, 1, 1)
+        assert (init.shape == kernel_matrix_shape)
         return init
 
     else:
@@ -681,6 +754,7 @@ class OrthogonalChannelMixing(nn.Module):
     """Base class for all orthogonal channel mixing layers.
 
     """
+
     def __init__(self,
                  in_channels: int,
                  method: str = 'cayley',
@@ -739,6 +813,7 @@ class InvertibleChannelMixing1D(OrthogonalChannelMixing):
         or ``"householder"``.
 
     """
+
     def __init__(self,
                  in_channels: int,
                  method: str = 'cayley',
@@ -763,6 +838,7 @@ class InvertibleChannelMixing1D(OrthogonalChannelMixing):
 
     def inverse(self, x):
         return nn.functional.conv_transpose1d(x, self.kernel)
+
 
 class InvertibleChannelMixing2D(OrthogonalChannelMixing):
     def __init__(self,
@@ -790,6 +866,7 @@ class InvertibleChannelMixing2D(OrthogonalChannelMixing):
 
     def inverse(self, x):
         return nn.functional.conv_transpose2d(x, self.kernel)
+
 
 class InvertibleChannelMixing3D(OrthogonalChannelMixing):
     def __init__(self,
