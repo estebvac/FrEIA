@@ -1,11 +1,26 @@
 import unittest
 
-import cv2
 import matplotlib.pyplot as plt
 import torch
 
-import FrEIA.framework as Ff
 from FrEIA.iunets import iUNet, IUnetCOnvBlock
+
+
+def checkerboard(shape, k):
+    """
+        shape: dimensions of output tensor
+        k: edge size of square
+    """
+
+    def indices(h, w):
+        return torch.stack(torch.meshgrid(torch.arange(h), torch.arange(w)))
+
+    h, w = shape
+    k = int(k)
+    base = indices(h // k, w // k).sum(dim=0) % 2
+    x = base.repeat_interleave(k, 0).repeat_interleave(k, 1)
+    chessboard = torch.stack(3 * [1 - x])
+    return chessboard
 
 
 def compare_reverse(batch, forward, reverse, layer):
@@ -20,8 +35,7 @@ def compare_reverse(batch, forward, reverse, layer):
     # print(f'TESTING BLOCK "{layer}"')
 
 
-img = cv2.resize(cv2.imread('docs/freia_logo.png'), (128, 128)) / 255.0
-input_image = torch.tensor(img).permute(2, 0, 1).type(torch.FloatTensor)
+input_image = checkerboard((128, 128), 16).to(torch.float32)
 batch = torch.stack([input_image, input_image], dim=0)
 # INN types:
 layers = ['nice', 'all', 'nvp', 'glow', 'gin', 'affine']
@@ -57,9 +71,3 @@ class IUnetBlockTest(unittest.TestCase):
             print(f"model with {c_l} layer")
             compare_reverse(batch[0], forward[0], reverse[0], c_l)
             del model
-
-
-
-# if __name__ == "__main__":
-#     unittest.main()
-
