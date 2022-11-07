@@ -198,7 +198,7 @@ class InvertibleUpsampling1D(OrthogonalResamplingLayer):
         dims_in = _check_in_dims(dims_in)
         self.in_channels = dims_in[0][0]
 
-        stride = tuple(_pair(stride))
+        stride = tuple(_single(stride))
         channel_multiplier = int(np.prod(stride))
         self.out_channels = self.in_channels // channel_multiplier
         super(InvertibleUpsampling1D, self).__init__(
